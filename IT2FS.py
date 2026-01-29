@@ -1,104 +1,161 @@
-from __future__ import annotations
+ from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Optional, Dict, Callable
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
+
+
+class FuzzyNumber:
+    def alpha_cut(self, alpha: float) -> Tuple[float, float]:
+        raise NotImplementedError
 
 
 @dataclass
-class TriangularFuzzyNumber:
+class TriangularFuzzyNumber(FuzzyNumber):
     a: float
     b: float
     c: float
     name: str = ""
 
     def alpha_cut(self, alpha: float) -> Tuple[float, float]:
-        L = self.a + alpha * (self.b - self.a)
-        R = self.c - alpha * (self.c - self.b)
-        return (max(0.0, L), max(0.0, R))
+        left = self.a + alpha * (self.b - self.a)
+        right = self.c - alpha * (self.c - self.b)
+        return (max(0.0, left), max(0.0, right))
 
-    def centroid(self, steps: int = 200) -> float:
-        xs = np.linspace(self.a, self.c, steps)
-        mu = np.zeros_like(xs)
-        left = xs <= self.b
-        right = xs >= self.b
-        if self.b != self.a:
-            mu[left] = (xs[left] - self.a) / (self.b - self.a)
-        else:
-            mu[left] = 1.0
-        if self.c != self.b:
-            mu[right] = (self.c - xs[right]) / (self.c - self.b)
-        else:
-            mu[right] = 1.0
-        mu = np.clip(mu, 0, 1)
-        if mu.sum() == 0:
-            return 0.0
-        return float((xs * mu).sum() / mu.sum())
 
-    def scaled(self, k: float) -> "TriangularFuzzyNumber":
-        # scale about mode b
-        return TriangularFuzzyNumber(self.b + (self.a - self.b) * k,
-                                     self.b,
-                                     self.b + (self.c - self.b) * k,
-                                     name=f"{self.name}_scaled_{k:.2f}")
-
+# Interval Type-2 Triangular Fuzzy Number
 @dataclass
 class IT2Triangular:
-    """Interval Type-2 as UMF (outer) and LMF (inner) triangles."""
     umf: TriangularFuzzyNumber
     lmf: TriangularFuzzyNumber
     name: str = ""
 
-    def alpha_outer(self, alpha: float) -> Tuple[float, float]:
-        return self.umf.alpha_cut(alpha)
+    def alpha(self, alpha: float, policy: str = "outer") -> Tuple[float, float]:
+        """
+        policy:
+        - 'outer'   : pessimistic (UMF)
+        - 'inner'   : optimistic (LMF)
+        - 'average' : neutral
+        """
+        if policy == "outer":
+            return self.umf.alpha_cut(alpha)
+        elif policy == "inner":
+            return self.lmf.alpha_cut(alpha)
+        elif policy == "average":
+            o = self.umf.alpha_cut(alpha)
+            i = self.lmf.alpha_cut(alpha)
+            return ((o[0] + i[0]) / 2, (o[1] + i[1]) / 2)
+        else:
+            raise ValueError("Unknown uncertainty policy")
 
-    def alpha_inner(self, alpha: float) -> Tuple[float, float]:
-        return self.lmf.alpha_cut(alpha)
-
-# -----------------------------
-# Interval arithmetic
-# -----------------------------
 
 def interval_mul(x: Tuple[float, float], y: Tuple[float, float]) -> Tuple[float, float]:
-    x1, x2 = x; y1, y2 = y
-    cand = [x1*y1, x1*y2, x2*y1, x2*y2]
-    return (min(cand), max(cand))
+    x1, x2 = x
+    y1, y2 = y
+    values = [x1*y1, x1*y2, x2*y1, x2*y2]
+    return (min(values), max(values))
+
 
 def prob_or(x: Tuple[float, float], y: Tuple[float, float]) -> Tuple[float, float]:
-    """Probabilistic OR with interval bounds: p(A∪B)=p(A)+p(B)-p(A)p(B)."""
-    x1, x2 = x; y1, y2 = y
     f = lambda a, b: a + b - a*b
-    cand = [f(x1,y1), f(x1,y2), f(x2,y1), f(x2,y2)]
-    return (min(cand), max(cand))
+    x1, x2 = x
+    y1, y2 = y
+    values = [f(x1,y1), f(x1,y2), f(x2,y1), f(x2,y2)]
+    return (min(values), max(values))
 
-def combine_list(intervals: List[Tuple[float, float]], op) -> Tuple[float, float]:
-    if not intervals:
-        return (0.0, 0.0)
-    cur = intervals[0]
-    for nxt in intervals[1:]:
-        cur = op(cur, nxt)
-    return cur
 
-# -----------------------------
-# Fault tree nodes
-# -----------------------------
+GATE_OPERATORS: Dict[str, Callable] = {
+    "AND": interval_mul,
+    "OR": prob_or
+}
+
+
+def combine_intervals(intervals: List[Tuple[float, float]],
+                      operator: Callable) -> Tuple[float, float]:
+    result = intervals[0]
+    for interval in intervals[1:]:
+        result = operator(result, interval)
+    return result
+
 
 class FTNode:
-    def __init__(self, gate: Optional[str] = None, children: Optional[List["FTNode"]] = None,
-                 value: Optional[IT2Triangular] = None, name: str = ""):
-        self.gate = gate  # None for leaf, else "AND" / "OR"
+    """
+    Generic Fault Tree Node supporting IT2 fuzzy uncertainty.
+    """
+
+    def __init__(self,
+                 gate: Optional[str] = None,
+                 children: Optional[List["FTNode"]] = None,
+                 value: Optional[IT2Triangular] = None,
+                 name: str = ""):
+
+        self.gate = gate
         self.children = children or []
         self.value = value
-        self.name = name or (value.name if value else gate)
+        self.name = name
 
-    def evaluate_alpha(self, alpha: float) -> Tuple[float, float]:
+    def evaluate_alpha(self,
+                       alpha: float,
+                       uncertainty_policy: str = "outer") -> Tuple[float, float]:
+
+        # Leaf node (basic event)
         if self.gate is None:
-            return self.value.alpha_outer(alpha)  # outer interval for conservative propagation
-        child_intervals = [ch.evaluate_alpha(alpha) for ch in self.children]
-        if self.gate == "AND":
-            return combine_list(child_intervals, interval_mul)
-        elif self.gate == "OR":
-            return combine_list(child_intervals, prob_or)
-        else:
-            raise ValueError("Unknown gate")
+            return self.value.alpha(alpha, uncertainty_policy)
+
+        # Gate node
+        if self.gate not in GATE_OPERATORS:
+            raise ValueError(f"Unsupported gate: {self.gate}")
+
+        operator = GATE_OPERATORS[self.gate]
+        child_intervals = [
+            child.evaluate_alpha(alpha, uncertainty_policy)
+            for child in self.children
+        ]
+
+        return combine_intervals(child_intervals, operator)
+
+def __run():
+    pump_failure = IT2Triangular(
+        umf=TriangularFuzzyNumber(0.02, 0.05, 0.08, "Pump_UMF"),
+        lmf=TriangularFuzzyNumber(0.03, 0.05, 0.06, "Pump_LMF"),
+        name="Pump Failure"
+    )
+
+    valve_failure = IT2Triangular(
+        umf=TriangularFuzzyNumber(0.01, 0.03, 0.06, "Valve_UMF"),
+        lmf=TriangularFuzzyNumber(0.02, 0.03, 0.04, "Valve_LMF"),
+        name="Valve Failure"
+    )
+
+    sensor_failure = IT2Triangular(
+        umf=TriangularFuzzyNumber(0.005, 0.01, 0.02, "Sensor_UMF"),
+        lmf=TriangularFuzzyNumber(0.007, 0.01, 0.015, "Sensor_LMF"),
+        name="Sensor Failure"
+    )
+
+    # --- Build fault tree ---
+    pump_node = FTNode(value=pump_failure, name="Pump")
+    valve_node = FTNode(value=valve_failure, name="Valve")
+    sensor_node = FTNode(value=sensor_failure, name="Sensor")
+
+    subsystem = FTNode(
+        gate="AND",
+        children=[pump_node, valve_node],
+        name="Subsystem Failure"
+    )
+
+    top_event = FTNode(
+        gate="OR",
+        children=[subsystem, sensor_node],
+        name="System Failure"
+    )
+
+    # --- Alpha-cut evaluation ---
+    print("Alpha-cut based IT2 FFTA Results\n")
+
+    for alpha in np.linspace(0, 1, 6):
+        interval = top_event.evaluate_alpha(
+            alpha,
+            uncertainty_policy="outer"
+        )
+        print(f"α = {alpha:.2f} → Failure Probability ∈ {interval}")
+
