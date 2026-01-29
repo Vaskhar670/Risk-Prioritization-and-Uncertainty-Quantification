@@ -1,4 +1,4 @@
- from __future__ import annotations
+from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Callable
 import numpy as np
@@ -158,4 +158,5 @@ def __run():
             uncertainty_policy="outer"
         )
         print(f"α = {alpha:.2f} → Failure Probability ∈ {interval}")
+
 
